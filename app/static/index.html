@@ -13,7 +13,7 @@
   .card { background: #fff; border: 1px solid #e3e5e8; border-radius: 8px; padding: 16px; margin-bottom: 16px; }
   textarea { width: 100%; min-height: 160px; font-family: ui-monospace, Consolas, monospace;
              font-size: 13px; padding: 8px; border: 1px solid #ccc; border-radius: 6px; resize: vertical; }
-  input[type=text] { font-family: ui-monospace, Consolas, monospace; font-size: 13px;
+  input[type=text], input[type=number] { font-family: ui-monospace, Consolas, monospace; font-size: 13px;
              padding: 6px 8px; border: 1px solid #ccc; border-radius: 6px; width: 150px; }
   button { padding: 8px 16px; border: none; border-radius: 6px; cursor: pointer;
            background: #2563eb; color: #fff; font-size: 14px; }
@@ -60,6 +60,8 @@
   .tr-none { color: #9ca3af; font-size: 12px; }
   .unmatched-list { margin-top: 12px; }
   .unmatched-list tr.unmatched { background: #fffbeb; }
+  tr.merged { background: #eff6ff; }
+  .param-row { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
 </style>
 </head>
 <body>
@@ -150,6 +152,38 @@
   </div>
   <div id="mergeMessage"></div>
   <div id="mergeResult"></div>
+</div>
+
+<hr class="feature-divider">
+<h1 id="speed">阅读速度修复</h1>
+<p class="hint">粘贴或上传 SRT，设置<strong>最大每秒字数</strong>与<strong>单块最长秒数</strong>（均为正数）。
+非空白字符各计一字，速度按每块字幕的<strong>起止跨度</strong>计算。唯一允许的修复手段是
+<strong>合并时间相邻（间隔 ≤ 500 毫秒）的连续字幕</strong>：合并块取首条起点、末条终点，
+正文按原顺序换行拼接；每块（含未合并单条）须同时满足速度与最长时长限制。
+全局规划以<strong>合并次数最少</strong>为先，仍并列时取<strong>切分位置序列字典序最小</strong>的方案。
+空时长、起止倒置或轨内重叠会报错；无可行方案时会明确指出无法修复。</p>
+
+<div class="card">
+  <h2>8. 字幕内容与速度限制</h2>
+  <input type="file" id="speedFile" accept=".srt,.txt">
+  <textarea id="speedSrt" placeholder="1&#10;00:00:01,000 --> 00:00:02,000&#10;第一句字幕&#10;&#10;2&#10;00:00:02,200 --> 00:00:03,000&#10;第二句字幕"></textarea>
+  <div class="param-row">
+    <span class="hint">最大每秒字数</span>
+    <input type="number" id="maxCps" min="0.01" step="0.5" value="20">
+    <span class="hint">单块最长秒数</span>
+    <input type="number" id="maxBlockSec" min="0.01" step="0.5" value="7">
+  </div>
+</div>
+
+<div class="card">
+  <h2>9. 预览与下载修复后 SRT</h2>
+  <div class="toolbar">
+    <button onclick="speedPreview()">预览修复方案</button>
+    <button id="speedExportBtn" onclick="speedExport()" disabled>下载修复后 SRT</button>
+    <span class="hint" id="speedExportHint">请先预览，存在可行方案后才能下载</span>
+  </div>
+  <div id="speedMessage"></div>
+  <div id="speedResult"></div>
 </div>
 
 <script>
@@ -539,6 +573,95 @@ async function mergeExport() {
   const a = document.createElement("a");
   a.href = URL.createObjectURL(blob);
   a.download = "bilingual.srt";
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ------------------------------------------------------------ 阅读速度修复
+
+bindTrackFile("speedFile", "speedSrt");
+
+function speedPayload() {
+  return JSON.stringify({
+    srt: $("speedSrt").value,
+    max_chars_per_sec: parseFloat($("maxCps").value),
+    max_block_sec: parseFloat($("maxBlockSec").value),
+  });
+}
+
+function showSpeedError(msg) {
+  $("speedMessage").innerHTML = `<div class="error">⚠ ${escapeHtml(msg)}</div>`;
+  $("speedResult").innerHTML = "";
+  $("speedExportBtn").disabled = true;
+}
+
+function speedErrText(data) {
+  if (!data) return "请求失败";
+  if (typeof data.detail === "string") return data.detail;
+  if (Array.isArray(data.detail))
+    return data.detail.map(d => d.msg || JSON.stringify(d)).join("；");
+  return "请求失败";
+}
+
+function renderSpeedPreview(pv) {
+  const rows = pv.blocks.map(b => `
+    <tr class="${b.merged ? "merged" : ""}">
+      <td>${b.index}</td>
+      <td class="mono">${escapeHtml(b.sources.join("、"))}${b.merged ? `（合并 ${b.sources.length} 条）` : ""}</td>
+      <td class="mono">${escapeHtml(b.start)} --&gt; ${escapeHtml(b.end)}</td>
+      <td>${b.duration_sec}</td>
+      <td>${b.chars}</td>
+      <td>${b.speed}</td>
+      <td class="mono">${escapeHtml(b.text)}</td>
+    </tr>`).join("");
+  $("speedResult").innerHTML = `<table>
+    <tr><th>新序号</th><th>来源序号</th><th>时间</th><th>时长(秒)</th>
+        <th>字数</th><th>速度(字/秒)</th><th>正文</th></tr>${rows}</table>`;
+  $("speedMessage").innerHTML =
+    `<div class="ok-banner">✓ 共 ${pv.entry_count} 条字幕 → ${pv.block_count} 块` +
+    `（合并 ${pv.merge_count} 次），每块均 ≤ ${pv.max_chars_per_sec} 字/秒` +
+    ` 且 ≤ ${pv.max_block_sec} 秒，可以下载。</div>`;
+  $("speedExportBtn").disabled = false;
+}
+
+async function speedPreview() {
+  $("speedMessage").innerHTML = "";
+  const cps = parseFloat($("maxCps").value), sec = parseFloat($("maxBlockSec").value);
+  if (!(cps > 0) || !(sec > 0))
+    return showSpeedError("最大每秒字数与单块最长秒数均须为正数");
+  let res;
+  try {
+    res = await fetch("/api/speed/preview", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: speedPayload(),
+    });
+  } catch (e) { return showSpeedError("网络错误：" + e); }
+  const data = await res.json();
+  if (!res.ok) return showSpeedError(speedErrText(data));
+  if (!data.feasible) {
+    $("speedResult").innerHTML = "";
+    $("speedExportBtn").disabled = true;
+    $("speedMessage").innerHTML =
+      `<div class="bad-banner">✗ 无法修复：${escapeHtml(data.reason)}</div>`;
+    return;
+  }
+  renderSpeedPreview(data);
+}
+
+async function speedExport() {
+  let res;
+  try {
+    res = await fetch("/api/speed/export", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: speedPayload(),
+    });
+  } catch (e) { return showSpeedError("网络错误：" + e); }
+  if (!res.ok) {
+    const data = await res.json();
+    return showSpeedError(speedErrText(data) || "下载被拒绝");
+  }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob);
+  a.download = "speed_fixed.srt";
   a.click();
   URL.revokeObjectURL(a.href);
 }

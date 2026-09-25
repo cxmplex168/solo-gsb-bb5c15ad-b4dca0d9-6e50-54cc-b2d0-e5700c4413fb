@@ -4,6 +4,7 @@
 按原时刻排序后在相邻锚点间做线性插值，两端按最近一段的斜率外推，
 统一换算每条字幕的起止时间，并检测负时间 / 起止倒置 / 与下一条重叠。
 """
+import math
 import re
 from pathlib import Path
 from typing import List
@@ -12,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
-app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成")
+app = FastAPI(title="SRT 字幕时间校准 / 片段剪辑 / 双语合成 / 阅读速度修复")
 
 STATIC_DIR = Path(__file__).parent / "static"
 
@@ -872,4 +873,225 @@ def export(req: CalibrateRequest):
         content=content.encode("utf-8"),
         media_type="application/x-subrip",
         headers={"Content-Disposition": 'attachment; filename="calibrated.srt"'},
+    )
+
+
+# ---------------------------------------------------------------- 阅读速度修复
+
+MERGE_GAP_MS = 500  # 允许合并的相邻字幕最大间隔（毫秒）
+
+
+class SpeedRequest(BaseModel):
+    srt: str
+    max_chars_per_sec: float  # 最大每秒字数（非空白字符）
+    max_block_sec: float      # 单块最长秒数
+
+
+def _speed_params(req: "SpeedRequest"):
+    """校验两个限制参数均为正数（有限），返回 (max_cps, max_sec)。"""
+    for name, v in (("最大每秒字数", req.max_chars_per_sec),
+                    ("单块最长秒数", req.max_block_sec)):
+        if v is None or math.isnan(v) or math.isinf(v) or v <= 0:
+            raise ValueError(f"{name}必须为正数")
+    return float(req.max_chars_per_sec), float(req.max_block_sec)
+
+
+def _count_nonspace(lines: List[str]) -> int:
+    """非空白字符数：空格、制表符、换行等空白均不计。"""
+    return sum(1 for ln in lines for ch in ln if not ch.isspace())
+
+
+def _validate_speed_track(entries: List[dict]) -> None:
+    """空时长 / 起止倒置 / 轨内重叠（含时间乱序）即抛 ValueError。"""
+    for i, e in enumerate(entries, 1):
+        if e["end"] <= e["start"]:
+            kind = "空时长" if e["end"] == e["start"] else "起止倒置"
+            raise ValueError(
+                f"第 {i} 条字幕（序号 {e['index']}）{kind}："
+                f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}"
+            )
+    for i in range(len(entries) - 1):
+        cur, nxt = entries[i], entries[i + 1]
+        if cur["end"] > nxt["start"]:
+            raise ValueError(
+                f"轨内重叠：第 {i + 1} 条（序号 {cur['index']}）终点 "
+                f"{fmt_time(cur['end'])} 晚于第 {i + 2} 条（序号 {nxt['index']}）"
+                f"起点 {fmt_time(nxt['start'])}"
+            )
+
+
+def plan_speed_fix(entries: List[dict], max_cps: float, max_sec: float):
+    """阅读速度修复的全局分块规划。
+
+    只允许把「间隔 ≤ 500ms 的连续字幕」合并成一块：合并块取首条起点、末条
+    终点，正文按原顺序换行拼接。每块（含未合并单条）须同时满足
+    速度（非空白字符数 / 起止跨度秒数）≤ max_cps 与时长 ≤ max_sec。
+
+    目标：合并次数最少（即块数最多）；仍并列时切分位置序列字典序最小
+    （切分点尽量靠前，等价于每块尽量短）。后缀 DP：choice[i] 取使
+    1 + blocks[j+1] 最大的最小 j——同块数下首切分点最小即保证全局切分
+    序列字典序最小（最优子结构：经 j 的方案以后缀最优解 blocks[j+1] 为上界）。
+
+    返回 (plan, reason)：plan 为 [(首条下标, 末条下标), ...]；无可行方案时
+    plan 为 None，reason 为无法修复的定位说明。
+    """
+    n = len(entries)
+    chars = [_count_nonspace(e["lines"]) for e in entries]
+    csum = [0] * (n + 1)
+    for i, c in enumerate(chars):
+        csum[i + 1] = csum[i] + c
+    # gap_ok[k]：第 k 条与第 k+1 条间隔 ≤ 500ms（无重叠已校验，间隔 ≥ 0）
+    gap_ok = [entries[k + 1]["start"] - entries[k]["end"] <= MERGE_GAP_MS
+              for k in range(n - 1)]
+    # maxreach[i]：以第 i 条为首、满足间隔约束的块最远末条下标（随 i 单调不减）
+    maxreach = [0] * n
+    r = 0
+    for i in range(n):
+        if r < i:
+            r = i
+        while r + 1 < n and gap_ok[r]:
+            r += 1
+        maxreach[i] = r
+    max_dur_ms = max_sec * 1000
+
+    def block_ok(i: int, j: int) -> bool:
+        dur_ms = entries[j]["end"] - entries[i]["start"]
+        if dur_ms > max_dur_ms:
+            return False
+        return (csum[j + 1] - csum[i]) * 1000 <= max_cps * dur_ms
+
+    blocks = [0] * (n + 1)  # blocks[i]：后缀 i..n-1 的最多块数，-1 表不可行
+    choice = [-1] * n
+    for i in range(n - 1, -1, -1):
+        best, bj = -1, -1
+        for j in range(i, maxreach[i] + 1):
+            # 块时长随 j 单调增，超限后不必再试更长的块
+            if entries[j]["end"] - entries[i]["start"] > max_dur_ms:
+                break
+            if blocks[j + 1] < 0 or not block_ok(i, j):
+                continue
+            cand = 1 + blocks[j + 1]
+            if cand > best:  # j 递增遍历，严格更大才更新 ⇒ 并列取最小 j
+                best, bj = cand, j
+        blocks[i] = best
+        choice[i] = bj
+
+    if blocks[0] >= 0:
+        plan = []
+        i = 0
+        while i < n:
+            j = choice[i]
+            plan.append((i, j))
+            i = j + 1
+        return plan, None
+
+    # 无法修复：前缀可达分析，定位第一个任何可行分块都覆盖不到的字幕
+    reach = [False] * (n + 1)  # reach[p]：前 p 条（0..p-1）可被完整分块
+    reach[0] = True
+    for p in range(1, n + 1):
+        for i in range(p - 1, -1, -1):
+            if maxreach[i] < p - 1:
+                break  # maxreach 随 i 单调不减，更小的 i 也够不到 p-1
+            if reach[i] and block_ok(i, p - 1):
+                reach[p] = True
+                break
+    stuck = max(p for p in range(n + 1) if reach[p])
+    # reach[stuck] 可达而 reach[stuck+1] 不可达 ⇒ 该条单块必然已超限
+    e = entries[stuck]
+    dur_ms = e["end"] - e["start"]
+    c = chars[stuck]
+    pos = (f"第 {stuck + 1} 条字幕（序号 {e['index']}，"
+           f"{fmt_time(e['start'])} --> {fmt_time(e['end'])}）")
+    if dur_ms > max_dur_ms:
+        reason = (f"{pos}单条时长 {dur_ms / 1000:.3f} 秒已超过单块最长 "
+                  f"{max_sec} 秒，合并只会更长，无法修复")
+    elif c * 1000 > max_cps * dur_ms:
+        left = stuck > 0 and gap_ok[stuck - 1]
+        right = stuck < n - 1 and gap_ok[stuck]
+        if not (left or right):
+            reason = (f"{pos}速度 {c * 1000 / dur_ms:.2f} 字/秒超过 "
+                      f"{max_cps} 字/秒，且与前后字幕间隔均超过 500 毫秒，"
+                      "无法合并降速，无法修复")
+        else:
+            reason = (f"{pos}速度 {c * 1000 / dur_ms:.2f} 字/秒超过 "
+                      f"{max_cps} 字/秒，与相邻字幕合并后仍无法同时满足"
+                      "速度与时长限制，无法修复")
+    else:
+        reason = f"{pos}附近无法得到满足速度与时长限制的分块方案，无法修复"
+    return None, reason
+
+
+def _speed_prepare(req: "SpeedRequest"):
+    """阅读速度修复公共预处理，返回 (entries, max_cps, max_sec, plan, reason)。"""
+    try:
+        max_cps, max_sec = _speed_params(req)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        entries = parse_srt(req.srt)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    try:
+        _validate_speed_track(entries)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    plan, reason = plan_speed_fix(entries, max_cps, max_sec)
+    return entries, max_cps, max_sec, plan, reason
+
+
+def _speed_blocks(entries: List[dict], plan: List[tuple]) -> List[dict]:
+    """按分块方案汇总每块的来源序号、时间、速度、合并正文。"""
+    out = []
+    for no, (i, j) in enumerate(plan, 1):
+        grp = entries[i:j + 1]
+        start, end = grp[0]["start"], grp[-1]["end"]
+        dur_ms = end - start
+        c = sum(_count_nonspace(e["lines"]) for e in grp)
+        lines = [ln for e in grp for ln in e["lines"]]
+        out.append({
+            "index": no,
+            "sources": [e["index"] for e in grp],
+            "start": fmt_time(start),
+            "end": fmt_time(end),
+            "duration_sec": round(dur_ms / 1000, 3),
+            "chars": c,
+            "speed": round(c * 1000 / dur_ms, 2),
+            "merged": j > i,
+            "lines": lines,
+            "text": "\n".join(lines),
+        })
+    return out
+
+
+@app.post("/api/speed/preview")
+def speed_preview(req: SpeedRequest):
+    entries, max_cps, max_sec, plan, reason = _speed_prepare(req)
+    if plan is None:
+        return {"feasible": False, "reason": reason}
+    blocks = _speed_blocks(entries, plan)
+    return {
+        "feasible": True,
+        "entry_count": len(entries),
+        "block_count": len(blocks),
+        "merge_count": len(entries) - len(blocks),
+        "max_chars_per_sec": max_cps,
+        "max_block_sec": max_sec,
+        "blocks": [{k: v for k, v in b.items() if k != "lines"} for b in blocks],
+    }
+
+
+@app.post("/api/speed/export")
+def speed_export(req: SpeedRequest):
+    entries, _cps, _sec, plan, reason = _speed_prepare(req)
+    if plan is None:
+        raise HTTPException(status_code=400, detail=f"无法修复：{reason}")
+    blocks = _speed_blocks(entries, plan)
+    content = "\n\n".join(
+        f"{b['index']}\n{b['start']} --> {b['end']}\n" + "\n".join(b["lines"])
+        for b in blocks
+    ) + "\n"
+    return Response(
+        content=content.encode("utf-8"),
+        media_type="application/x-subrip",
+        headers={"Content-Disposition": 'attachment; filename="speed_fixed.srt"'},
     )
